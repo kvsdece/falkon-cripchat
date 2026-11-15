@@ -1,0 +1,19 @@
+[package]
+name = "falkon-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+tor-onion = []
+
+[dependencies]
+falkon-core = { path = "../falkon-core" }
+snow = "0.10"
+tokio = { version = "1", features = ["full"] }
+zeroize = { version = "1.9", features = ["derive"] }
