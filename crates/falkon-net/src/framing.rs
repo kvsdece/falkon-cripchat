@@ -7,6 +7,7 @@ use falkon_core::crypto::MAX_NOISE_MSG_LEN;
 use falkon_core::error::FalkonError;
 
 pub const IO_TIMEOUT: Duration = Duration::from_secs(15);
+pub const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(75);
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
@@ -33,7 +34,14 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 }
 
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, FalkonError> {
-    timeout(IO_TIMEOUT, async {
+    read_frame_with_timeout(reader, IO_TIMEOUT).await
+}
+
+pub async fn read_frame_with_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    dur: Duration,
+) -> Result<Vec<u8>, FalkonError> {
+    timeout(dur, async {
         let mut len_buf = [0u8; 4];
         reader
             .read_exact(&mut len_buf)

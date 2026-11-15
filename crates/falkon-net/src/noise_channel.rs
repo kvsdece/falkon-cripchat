@@ -1,4 +1,7 @@
-use tokio::io::{AsyncRead, AsyncWrite};
+use core::time::Duration;
+use std::sync::{Arc, Mutex};
+
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use zeroize::Zeroizing;
 
 use falkon_core::crypto::{
@@ -8,11 +11,22 @@ use falkon_core::crypto::{
 use falkon_core::error::FalkonError;
 use falkon_core::protocol::{WireEnvelope, decode_padded_envelope, encode_padded_envelope};
 
-use crate::framing::{read_frame, write_frame};
+use crate::framing::{read_frame, read_frame_with_timeout, write_frame};
 
 pub struct EncryptedChannel<S> {
     stream: S,
     transport: snow::TransportState,
+    remote_fingerprint: String,
+}
+
+pub struct ChannelSender<S> {
+    writer: WriteHalf<S>,
+    transport: Arc<Mutex<snow::TransportState>>,
+}
+
+pub struct ChannelReceiver<S> {
+    reader: ReadHalf<S>,
+    transport: Arc<Mutex<snow::TransportState>>,
     remote_fingerprint: String,
 }
 
@@ -101,6 +115,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedChannel<S> {
         &self.remote_fingerprint
     }
 
+    pub fn into_split(self) -> (ChannelSender<S>, ChannelReceiver<S>) {
+        let (reader, writer) = tokio::io::split(self.stream);
+        let transport = Arc::new(Mutex::new(self.transport));
+        (
+            ChannelSender {
+                writer,
+                transport: Arc::clone(&transport),
+            },
+            ChannelReceiver {
+                reader,
+                transport,
+                remote_fingerprint: self.remote_fingerprint,
+            },
+        )
+    }
+
     pub async fn send_envelope(&mut self, envelope: &WireEnvelope) -> Result<(), FalkonError> {
         let padded = encode_padded_envelope(envelope)?;
         if padded.len() + NOISE_TAG_LEN > MAX_NOISE_MSG_LEN {
@@ -126,6 +156,56 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedChannel<S> {
             .transport
             .read_message(&encrypted, &mut decrypted)
             .map_err(|e| FalkonError::Crypto(e.to_string()))?;
+
+        decode_padded_envelope(&decrypted[..n])
+    }
+}
+
+impl<S: AsyncWrite + Unpin> ChannelSender<S> {
+    pub async fn send_envelope(&mut self, envelope: &WireEnvelope) -> Result<(), FalkonError> {
+        let padded = encode_padded_envelope(envelope)?;
+        if padded.len() + NOISE_TAG_LEN > MAX_NOISE_MSG_LEN {
+            return Err(FalkonError::FrameTooLarge {
+                len: padded.len() + NOISE_TAG_LEN,
+                max: MAX_NOISE_MSG_LEN,
+            });
+        }
+
+        let mut encrypted = vec![0u8; padded.len() + NOISE_TAG_LEN];
+        let n = {
+            let mut guard = self
+                .transport
+                .lock()
+                .map_err(|_| FalkonError::InvalidState("mutex Noise corrompido"))?;
+            guard
+                .write_message(&padded, &mut encrypted)
+                .map_err(|e| FalkonError::Crypto(e.to_string()))?
+        };
+
+        write_frame(&mut self.writer, &encrypted[..n]).await
+    }
+}
+
+impl<S: AsyncRead + Unpin> ChannelReceiver<S> {
+    pub fn remote_fingerprint(&self) -> &str {
+        &self.remote_fingerprint
+    }
+
+    pub async fn recv_envelope(
+        &mut self,
+        read_timeout: Duration,
+    ) -> Result<WireEnvelope, FalkonError> {
+        let encrypted = read_frame_with_timeout(&mut self.reader, read_timeout).await?;
+        let mut decrypted = Zeroizing::new(vec![0u8; encrypted.len()]);
+        let n = {
+            let mut guard = self
+                .transport
+                .lock()
+                .map_err(|_| FalkonError::InvalidState("mutex Noise corrompido"))?;
+            guard
+                .read_message(&encrypted, &mut decrypted)
+                .map_err(|e| FalkonError::Crypto(e.to_string()))?
+        };
 
         decode_padded_envelope(&decrypted[..n])
     }
