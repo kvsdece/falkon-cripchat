@@ -2,6 +2,10 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 
+mod app;
+mod setup;
+mod ui;
+
 use core::time::Duration;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -9,36 +13,35 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::style::Color;
 use tokio::sync::mpsc;
-use zeroize::Zeroize;
 
-use falkon_core::crypto::{
-    IdentityKeypair, RoomSecret, derive_room_psk, peer_id_from_pubkey, random_bytes,
-};
-use falkon_core::protocol::{ChatPayload, HistoryRetention, PeerId, PeerSummary};
+use falkon_core::crypto::{IdentityKeypair, derive_room_psk, peer_id_from_pubkey, random_bytes};
+use falkon_core::protocol::{ChatPayload, HistoryRetention};
 use falkon_core::sanitize::sanitize_nick;
 use falkon_net::host::{HostCommand, HostConfig, HostEvent, run_host};
 use falkon_net::peer::{PeerCommand, PeerConfig, PeerEvent, run_peer};
 use falkon_net::transport::DirectTcpTransport;
 
-const MAX_DISPLAY_LINES: usize = 200;
+use crate::app::{AppState, PendingVotePrompt, help_lines};
+use crate::setup::{StartupMode, prompt_room_secret, run_interactive_setup};
+use crate::ui::draw_ui;
 
-const PEER_PALETTE: [Color; 10] = [
-    Color::LightGreen,
-    Color::LightCyan,
-    Color::LightMagenta,
-    Color::LightBlue,
-    Color::LightYellow,
-    Color::LightRed,
-    Color::Green,
-    Color::Cyan,
-    Color::Magenta,
-    Color::Blue,
-];
+const EXAMPLES_HELP: &str = "\
+EXEMPLOS DE USO:
+  1) Abrir menu interativo (recomendado para iniciantes):
+       falkon
+
+  2) Mesmo computador (Host + Peer em 2 terminais):
+       falkon --nick Clara --listen 127.0.0.1:7777 --retention 15s
+       falkon --nick Mateus --connect 127.0.0.1:7777
+
+  3) Rede local / Wi-Fi (Host aceitando conexoes da LAN):
+       falkon --nick Clara --listen 0.0.0.0:7777 --retention 60s
+       falkon --nick Mateus --connect IP_DO_HOST:7777
+
+  4) Modo Preview local (testar interface sem rede):
+       falkon --preview";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum RetentionArg {
@@ -66,20 +69,29 @@ impl From<RetentionArg> for HistoryRetention {
 #[command(
     name = "falkon",
     version,
-    about = "Falkon — Chat P2P E2EE 100% Terminal"
+    about = "Falkon — Chat P2P E2EE 100% Terminal",
+    after_help = EXAMPLES_HELP
 )]
 struct Cli {
+    /// Apelido exibido dentro do canal cifrado
     #[arg(long, default_value = "Anonimo")]
     nick: String,
 
-    #[arg(long)]
+    /// Abre uma sala como Host em IP:PORTA (ex.: 127.0.0.1:7777 ou 0.0.0.0:7777)
+    #[arg(long, conflicts_with_all = ["connect", "preview"])]
     listen: Option<String>,
 
-    #[arg(long)]
+    /// Conecta a uma sala existente em IP:PORTA (ex.: 127.0.0.1:7777)
+    #[arg(long, conflicts_with_all = ["listen", "preview"])]
     connect: Option<String>,
 
+    /// Ciclo de limpeza do historico ativo quando atuando como Host
     #[arg(long, value_enum, default_value_t = RetentionArg::Secs15)]
     retention: RetentionArg,
+
+    /// Abre direto o modo Preview offline sem rede
+    #[arg(long)]
+    preview: bool,
 }
 
 struct TerminalGuard;
@@ -90,142 +102,10 @@ impl Drop for TerminalGuard {
     }
 }
 
-#[derive(Clone)]
-struct PendingVotePrompt {
-    candidate_id: PeerId,
-    nick: String,
-    fingerprint: String,
-}
-
-enum DisplayEntry {
-    Chat {
-        payload: ChatPayload,
-        received_at: Instant,
-    },
-    Notice {
-        tag: &'static str,
-        color: Color,
-        text: String,
-    },
-}
-
 enum NetControl {
     Host(mpsc::Sender<HostCommand>),
     Peer(mpsc::Sender<PeerCommand>),
     Preview,
-}
-
-struct AppState {
-    my_peer_id: PeerId,
-    nick: String,
-    fingerprint: String,
-    full_fingerprint: String,
-    mode_label: String,
-    retention: HistoryRetention,
-    retention_known: bool,
-    status_line: String,
-    messages: VecDeque<DisplayEntry>,
-    peers: Vec<PeerSummary>,
-    peer_colors: HashMap<PeerId, Color>,
-    pending_votes: VecDeque<PendingVotePrompt>,
-    input: String,
-    should_quit: bool,
-}
-
-impl AppState {
-    fn ensure_peer_color(&mut self, id: PeerId) -> Color {
-        if let Some(&existing) = self.peer_colors.get(&id) {
-            return existing;
-        }
-        let start = usize::from(id[0]) % PEER_PALETTE.len();
-        let mut chosen = PEER_PALETTE[start];
-        let mut best_count = usize::MAX;
-
-        for offset in 0..PEER_PALETTE.len() {
-            let candidate = PEER_PALETTE[(start + offset) % PEER_PALETTE.len()];
-            let count = self
-                .peer_colors
-                .values()
-                .filter(|&&c| c == candidate)
-                .count();
-            if count < best_count {
-                best_count = count;
-                chosen = candidate;
-            }
-        }
-        self.peer_colors.insert(id, chosen);
-        chosen
-    }
-
-    fn push_chat(&mut self, payload: ChatPayload) {
-        self.push_chat_at(payload, Instant::now());
-    }
-
-    fn push_chat_at(&mut self, payload: ChatPayload, now: Instant) {
-        let _ = self.ensure_peer_color(payload.sender_id);
-        self.push_entry(DisplayEntry::Chat {
-            payload,
-            received_at: now,
-        });
-    }
-
-    fn push_notice(&mut self, tag: &'static str, color: Color, text: String) {
-        self.push_entry(DisplayEntry::Notice { tag, color, text });
-    }
-
-    fn push_entry(&mut self, entry: DisplayEntry) {
-        if self.messages.len() >= MAX_DISPLAY_LINES {
-            let _ = self.messages.pop_front();
-        }
-        self.messages.push_back(entry);
-    }
-
-    fn sync_peers(&mut self, list: Vec<PeerSummary>) {
-        for p in &list {
-            let _ = self.ensure_peer_color(p.id);
-        }
-        self.peers = list;
-    }
-
-    /// Expira e zeroiza da RAM mensagens exibidas na UI cuja retencao TTL venceu.
-    fn purge_expired_ui(&mut self, now: Instant) -> usize {
-        if !self.retention_known {
-            return 0;
-        }
-        let Some(ttl) = self.retention.as_duration() else {
-            return 0;
-        };
-
-        let mut removed = 0usize;
-        let mut kept = VecDeque::with_capacity(self.messages.len());
-        while let Some(mut entry) = self.messages.pop_front() {
-            match &mut entry {
-                DisplayEntry::Chat {
-                    payload,
-                    received_at,
-                } if now.saturating_duration_since(*received_at) >= ttl => {
-                    payload.zeroize();
-                    removed += 1;
-                }
-                _ => kept.push_back(entry),
-            }
-        }
-        self.messages = kept;
-        removed
-    }
-
-    fn wipe_ram(&mut self) {
-        for mut entry in self.messages.drain(..) {
-            match &mut entry {
-                DisplayEntry::Chat { payload, .. } => payload.zeroize(),
-                DisplayEntry::Notice { text, .. } => text.zeroize(),
-            }
-        }
-        self.input.zeroize();
-        self.peers.clear();
-        self.peer_colors.clear();
-        self.pending_votes.clear();
-    }
 }
 
 fn disable_core_dumps() {
@@ -240,19 +120,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     disable_core_dumps();
 
     let cli = Cli::parse();
-    let nick = sanitize_nick(&cli.nick)?;
-    let retention: HistoryRetention = cli.retention.into();
+    let default_nick = sanitize_nick(&cli.nick)?;
+    let default_retention: HistoryRetention = cli.retention.into();
+
+    let startup = match (cli.listen, cli.connect, cli.preview) {
+        (Some(listen_addr), None, false) => {
+            let Some(secret) = prompt_room_secret(true)? else {
+                return Ok(());
+            };
+            StartupMode::Host {
+                listen_addr,
+                nick: default_nick,
+                retention: default_retention,
+                secret,
+            }
+        }
+        (None, Some(connect_addr), false) => {
+            let Some(secret) = prompt_room_secret(false)? else {
+                return Ok(());
+            };
+            StartupMode::Peer {
+                connect_addr,
+                nick: default_nick,
+                secret,
+            }
+        }
+        (None, None, true) => StartupMode::Preview {
+            nick: default_nick,
+            retention: default_retention,
+        },
+        (None, None, false) => run_interactive_setup(&default_nick, default_retention)?,
+        _ => StartupMode::Exit,
+    };
+
     let identity = IdentityKeypair::generate()?;
     let my_fp = identity.fingerprint();
     let my_full_fp = identity.full_fingerprint();
     let my_peer_id = peer_id_from_pubkey(identity.public_key());
 
-    let (net_ctrl, mut host_ev_rx, mut peer_ev_rx, mode_label, retention_known) =
-        match (cli.listen, cli.connect) {
-            (Some(listen_addr), _) => {
-                let raw_secret =
-                    rpassword::prompt_password("Segredo da sala (min. 12 chars, oculto): ")?;
-                let secret = RoomSecret::new(raw_secret)?;
+    let (nick, retention, net_ctrl, mut host_ev_rx, mut peer_ev_rx, mode_label, retention_known) =
+        match startup {
+            StartupMode::Exit => return Ok(()),
+            StartupMode::Host {
+                listen_addr,
+                nick,
+                retention,
+                secret,
+            } => {
                 let room_salt = random_bytes::<16>()?;
                 let psk = derive_room_psk(&secret, &room_salt)?;
                 drop(secret);
@@ -274,6 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
 
                 (
+                    nick,
+                    retention,
                     NetControl::Host(cmd_tx),
                     Some(ev_rx),
                     None,
@@ -281,11 +197,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     true,
                 )
             }
-            (None, Some(connect_addr)) => {
-                let raw_secret =
-                    rpassword::prompt_password("Segredo da sala (min. 12 chars, oculto): ")?;
-                let secret = RoomSecret::new(raw_secret)?;
-
+            StartupMode::Peer {
+                connect_addr,
+                nick,
+                secret,
+            } => {
                 let (cmd_tx, cmd_rx) = mpsc::channel(64);
                 let (ev_tx, ev_rx) = mpsc::channel(128);
                 let transport = Arc::new(DirectTcpTransport);
@@ -301,6 +217,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
 
                 (
+                    nick,
+                    default_retention,
                     NetControl::Peer(cmd_tx),
                     None,
                     Some(ev_rx),
@@ -308,11 +226,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     false,
                 )
             }
-            (None, None) => (
+            StartupMode::Preview { nick, retention } => (
+                nick,
+                retention,
                 NetControl::Preview,
                 None,
                 None,
-                "PREVIEW (use --listen ou --connect)".to_owned(),
+                "PREVIEW LOCAL (sem rede)".to_owned(),
                 true,
             ),
         };
@@ -326,11 +246,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         retention,
         retention_known,
         status_line: "Canal pronto.".to_owned(),
+        disconnected: false,
         messages: VecDeque::new(),
         peers: Vec::new(),
         peer_colors: HashMap::new(),
         pending_votes: VecDeque::new(),
         input: String::new(),
+        cursor_char_idx: 0,
+        scroll_from_bottom: 0,
         should_quit: false,
     };
     let _ = app.ensure_peer_color(my_peer_id);
@@ -338,8 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.push_notice(
         "SISTEMA",
         Color::DarkGray,
-        "Comandos: /nick <nome> | /fingerprint | /wipe (limpar e sair) | /quit | ESC sai"
-            .to_owned(),
+        "Interface Helena ativa. Digite /help para ver comandos e atalhos.".to_owned(),
     );
 
     let mut terminal = ratatui::init();
@@ -348,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut purge_tick = tokio::time::interval(Duration::from_secs(1));
 
     while !app.should_quit {
-        terminal.draw(|frame| draw_ui(frame, &app))?;
+        terminal.draw(|frame| draw_ui(frame, &mut app))?;
 
         tokio::select! {
             _ = ui_tick.tick() => {
@@ -380,11 +302,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(HostEvent::Listening(addr)) => {
                         app.mode_label = format!("HOST ({addr})");
                         app.status_line = format!("Ouvindo em {addr} (P2P-TCP)");
-                        app.push_notice(
-                            "HOST",
-                            Color::Cyan,
-                            format!("Sala aberta em {addr}. Aguardando peers..."),
-                        );
+                        let tip = if let Some(port) = addr.strip_prefix("0.0.0.0:") {
+                            format!(
+                                "Sala aberta em {addr}. Mesmo PC: falkon --connect 127.0.0.1:{port} | LAN: use IP_DESTA_MAQUINA:{port}"
+                            )
+                        } else {
+                            format!("Sala aberta em {addr}. Contatos conectam com: falkon --connect {addr}")
+                        };
+                        app.push_notice("HOST", Color::Cyan, tip);
                     }
                     Some(HostEvent::SystemNotice(msg)) => {
                         app.push_notice("SISTEMA", Color::DarkGray, msg);
@@ -423,6 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                     None => {
+                        app.disconnected = true;
                         app.status_line = "Motor Host encerrado.".to_owned();
                     }
                 }
@@ -479,10 +405,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.sync_peers(list);
                     }
                     Some(PeerEvent::Disconnected(reason)) => {
+                        app.disconnected = true;
                         app.status_line = format!("Desconectado: {reason}");
                         app.push_notice("REDE", Color::Red, format!("Desconectado: {reason}"));
                     }
                     None => {
+                        app.disconnected = true;
                         app.status_line = "Conexao encerrada.".to_owned();
                     }
                 }
@@ -503,18 +431,19 @@ async fn handle_key(code: KeyCode, app: &mut AppState, net: &NetControl) {
         KeyCode::F(1) => cast_next_vote(app, net, true, true).await,
         KeyCode::F(2) => cast_next_vote(app, net, true, false).await,
         KeyCode::F(3) => cast_next_vote(app, net, false, false).await,
-        KeyCode::Backspace => {
-            let _ = app.input.pop();
-        }
-        KeyCode::Char(c) => {
-            if app.input.chars().count() < 1024 {
-                app.input.push(c);
-            }
-        }
+        KeyCode::Left => app.move_left(),
+        KeyCode::Right => app.move_right(),
+        KeyCode::Home => app.move_home(),
+        KeyCode::End => app.move_end(),
+        KeyCode::Up => app.scroll_up(1),
+        KeyCode::Down => app.scroll_down(1),
+        KeyCode::PageUp => app.scroll_up(5),
+        KeyCode::PageDown => app.scroll_down(5),
+        KeyCode::Backspace => app.backspace(),
+        KeyCode::Delete => app.delete_char(),
+        KeyCode::Char(c) => app.insert_char(c),
         KeyCode::Enter => {
-            let text = app.input.trim().to_owned();
-            app.input.zeroize();
-            app.input.clear();
+            let text = app.take_submitted_input();
             if text.is_empty() {
                 return;
             }
@@ -523,6 +452,51 @@ async fn handle_key(code: KeyCode, app: &mut AppState, net: &NetControl) {
                 let wipe = text == "/wipe";
                 send_shutdown(net, wipe).await;
                 app.should_quit = true;
+                return;
+            }
+
+            if text == "/clear" {
+                app.clear_chat_screen();
+                app.push_notice(
+                    "SISTEMA",
+                    Color::DarkGray,
+                    "Tela local limpa e zeroizada.".to_owned(),
+                );
+                return;
+            }
+
+            if text == "/help" {
+                for line in help_lines() {
+                    app.push_notice("AJUDA", Color::Cyan, line);
+                }
+                return;
+            }
+
+            if text == "/peers" {
+                if app.peers.is_empty() {
+                    app.push_notice(
+                        "PEERS",
+                        Color::DarkGray,
+                        "Nenhum peer listado (modo Preview).".to_owned(),
+                    );
+                } else {
+                    app.push_notice(
+                        "PEERS",
+                        Color::Cyan,
+                        format!("{} participante(s) ativo(s):", app.peers.len()),
+                    );
+                    let lines: Vec<String> = app
+                        .peers
+                        .iter()
+                        .map(|p| {
+                            let role = if p.is_host { "HOST" } else { "PEER" };
+                            format!("  [{role}] {} — FP: {}", p.nick, p.fingerprint)
+                        })
+                        .collect();
+                    for line in lines {
+                        app.push_notice("PEERS", Color::Cyan, line);
+                    }
+                }
                 return;
             }
 
@@ -624,225 +598,5 @@ async fn send_shutdown(net: &NetControl, wipe: bool) {
             let _ = tx.send(PeerCommand::Disconnect).await;
         }
         NetControl::Preview => {}
-    }
-}
-
-fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
-    let vote_height = if app.pending_votes.is_empty() { 0 } else { 3 };
-    let ret_label = if app.retention_known {
-        app.retention.label()
-    } else {
-        "Sincronizando..."
-    };
-
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(6),
-            Constraint::Length(vote_height),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
-
-    let header = Paragraph::new(format!(
-        "FALKON v0.3.1 (Diego) | Nick: {} | FP: {} | Retencao: {}\nModo: {} | {}",
-        app.nick, app.fingerprint, ret_label, app.mode_label, app.status_line
-    ))
-    .wrap(Wrap { trim: false })
-    .style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )
-    .block(Block::default().borders(Borders::ALL).title("Status E2EE"));
-    frame.render_widget(header, outer[0]);
-
-    let mid = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
-        .split(outer[1]);
-
-    let chat_area = mid[0];
-    let inner_width = usize::from(chat_area.width.saturating_sub(2)).max(1);
-    let inner_height = usize::from(chat_area.height.saturating_sub(2));
-
-    let mut chat_lines: Vec<Line<'_>> = Vec::new();
-    let mut total_visual_lines: usize = 0;
-
-    for entry in &app.messages {
-        match entry {
-            DisplayEntry::Chat { payload, .. } => {
-                let nick_color = app
-                    .peer_colors
-                    .get(&payload.sender_id)
-                    .copied()
-                    .unwrap_or(Color::LightCyan);
-                let mut sublines = payload.body.split('\n');
-                if let Some(first) = sublines.next() {
-                    let prefix = format!("<{}> ", payload.sender_nick);
-                    let line_chars = prefix.chars().count() + first.chars().count();
-                    total_visual_lines += line_chars.max(1).div_ceil(inner_width);
-                    chat_lines.push(Line::from(vec![
-                        Span::styled(
-                            prefix,
-                            Style::default().fg(nick_color).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(first),
-                    ]));
-                }
-                for rest in sublines {
-                    let line_chars = 2 + rest.chars().count();
-                    total_visual_lines += line_chars.max(1).div_ceil(inner_width);
-                    chat_lines.push(Line::from(Span::raw(format!("  {rest}"))));
-                }
-            }
-            DisplayEntry::Notice { tag, color, text } => {
-                let prefix = format!("[{tag}] ");
-                for (idx, part) in text.split('\n').enumerate() {
-                    if idx == 0 {
-                        let line_chars = prefix.chars().count() + part.chars().count();
-                        total_visual_lines += line_chars.max(1).div_ceil(inner_width);
-                        chat_lines.push(Line::from(vec![
-                            Span::styled(
-                                prefix.clone(),
-                                Style::default().fg(*color).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw(part),
-                        ]));
-                    } else {
-                        let line_chars = 2 + part.chars().count();
-                        total_visual_lines += line_chars.max(1).div_ceil(inner_width);
-                        chat_lines.push(Line::from(Span::raw(format!("  {part}"))));
-                    }
-                }
-            }
-        }
-    }
-
-    let scroll_y =
-        u16::try_from(total_visual_lines.saturating_sub(inner_height)).unwrap_or(u16::MAX);
-
-    let chat = Paragraph::new(chat_lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_y, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Canal Efemero"),
-        );
-    frame.render_widget(chat, chat_area);
-
-    let peer_items: Vec<ListItem<'_>> = app
-        .peers
-        .iter()
-        .map(|p| {
-            let color = app
-                .peer_colors
-                .get(&p.id)
-                .copied()
-                .unwrap_or(Color::LightCyan);
-            let role = if p.is_host { "[HOST] " } else { "" };
-            let (fp_top, fp_bot) = if p.fingerprint.len() > 18 {
-                let (a, b) = p.fingerprint.split_at(17);
-                (a, b.trim_start_matches('-'))
-            } else {
-                (p.fingerprint.as_str(), "")
-            };
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        role,
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        p.nick.as_str(),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(Span::styled(
-                    format!("  {fp_top}"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ];
-            if !fp_bot.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("  {fp_bot}"),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            ListItem::new(lines)
-        })
-        .collect();
-    let peers_list =
-        List::new(peer_items).block(Block::default().borders(Borders::ALL).title("Peers Ativos"));
-    frame.render_widget(peers_list, mid[1]);
-
-    if let Some(vote) = app.pending_votes.front() {
-        let banner = Paragraph::new(format!(
-            "VOTACAO: '{}' ({}) | [F1] Aceitar + Historico | [F2] Aceitar SEM Historico | [F3] Recusar",
-            vote.nick, vote.fingerprint
-        ))
-        .style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(Block::default().borders(Borders::ALL).title("Admissao P2P"));
-        frame.render_widget(banner, outer[2]);
-    }
-
-    let input = Paragraph::new(app.input.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Mensagem (Enter envia | /nick | /fingerprint | /wipe | ESC sai)"),
-    );
-    frame.render_widget(input, outer[3]);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ui_messages_purge_and_zeroize_on_ttl() {
-        let start = Instant::now();
-        let mut app = AppState {
-            my_peer_id: [0u8; 16],
-            nick: "Host".to_owned(),
-            fingerprint: "0000".to_owned(),
-            full_fingerprint: "0000".to_owned(),
-            mode_label: "TEST".to_owned(),
-            retention: HistoryRetention::Secs5,
-            retention_known: true,
-            status_line: String::new(),
-            messages: VecDeque::new(),
-            peers: Vec::new(),
-            peer_colors: HashMap::new(),
-            pending_votes: VecDeque::new(),
-            input: String::new(),
-            should_quit: false,
-        };
-
-        app.push_chat_at(
-            ChatPayload {
-                msg_id: [1u8; 16],
-                sender_id: [2u8; 16],
-                sender_nick: "Diego".to_owned(),
-                body: "segredo efemero".to_owned(),
-                sent_unix_secs: 0,
-            },
-            start,
-        );
-        app.push_notice("SISTEMA", Color::DarkGray, "aviso fixo".to_owned());
-
-        assert_eq!(app.messages.len(), 2);
-        assert_eq!(app.purge_expired_ui(start + Duration::from_secs(3)), 0);
-        assert_eq!(app.messages.len(), 2);
-
-        assert_eq!(app.purge_expired_ui(start + Duration::from_secs(6)), 1);
-        assert_eq!(app.messages.len(), 1);
     }
 }

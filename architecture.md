@@ -137,8 +137,8 @@ falkon/
 | **M1 — Base, Cripto & Abstração TCP** | [Ponto 1](#ponto-1) + [Ponto 2](#ponto-2) | `v0.1.0` | Implementação — **"Clara"** | **Concluído** |
 | **M2 — Motor Host & Votação P2P** | [Ponto 3](#ponto-3) | `v0.2.0` / `v0.2.1` | Implementação — **"Sofía"** | **Concluído** |
 | **M3 — Blindagem & Anti-DoS** | [Ponto 4](#ponto-4) | `v0.3.0` / `v0.3.1` | Segurança — **"Diego"** | **Concluído** |
-| **M4 — Interface TUI (`ratatui`)** | [Ponto 5](#ponto-5) | `v0.4.0` | Implementação — **"Helena"** | **Próximo** |
-| **M5 — Auditoria & Fuzzing (1.0)** | [Ponto 6](#ponto-6) | `v1.0.0` | Segurança — **"Mateus"** | Pendente |
+| **M4 — Interface TUI (`ratatui`)** | [Ponto 5](#ponto-5) | `v0.4.0` | Implementação — **"Helena"** | **Concluído** |
+| **M5 — Auditoria & Fuzzing (1.0)** | [Ponto 6](#ponto-6) | `v1.0.0` | Segurança — **"Mateus"** | **Próximo** |
 | **M6 — Canal `.onion` Nativa** | [Ponto 7](#ponto-7) | `v2.0.0` | Implementação — **"Valentina"** | Pendente |
 
 <a id="fluxo-release-web"></a>
