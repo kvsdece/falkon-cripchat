@@ -7,3 +7,4 @@ pub mod error;
 pub mod protocol;
 pub mod room;
 pub mod sanitize;
+pub mod security;

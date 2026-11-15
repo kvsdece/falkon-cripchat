@@ -7,5 +7,6 @@ pub mod host;
 pub mod noise_channel;
 pub mod onion;
 pub mod peer;
+pub mod ratelimit;
 pub mod session;
 pub mod transport;

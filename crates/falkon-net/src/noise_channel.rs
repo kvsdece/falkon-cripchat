@@ -11,7 +11,7 @@ use falkon_core::crypto::{
 use falkon_core::error::FalkonError;
 use falkon_core::protocol::{WireEnvelope, decode_padded_envelope, encode_padded_envelope};
 
-use crate::framing::{read_frame, read_frame_with_timeout, write_frame};
+use crate::framing::{read_frame, read_frame_with_timeout, read_handshake_frame, write_frame};
 
 pub struct EncryptedChannel<S> {
     stream: S,
@@ -47,7 +47,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedChannel<S> {
             .map_err(|e| FalkonError::Crypto(e.to_string()))?;
         write_frame(&mut stream, &out_buf[..n]).await?;
 
-        let msg2 = read_frame(&mut stream).await?;
+        let msg2 = read_handshake_frame(&mut stream).await?;
         let _ = hs
             .read_message(&msg2, &mut plain_buf)
             .map_err(|e| FalkonError::Crypto(e.to_string()))?;
@@ -84,7 +84,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedChannel<S> {
         let mut out_buf = Zeroizing::new(vec![0u8; 1024]);
         let mut plain_buf = Zeroizing::new(vec![0u8; 1024]);
 
-        let msg1 = read_frame(&mut stream).await?;
+        let msg1 = read_handshake_frame(&mut stream).await?;
         let _ = hs
             .read_message(&msg1, &mut plain_buf)
             .map_err(|e| FalkonError::Crypto(e.to_string()))?;
@@ -94,7 +94,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedChannel<S> {
             .map_err(|e| FalkonError::Crypto(e.to_string()))?;
         write_frame(&mut stream, &out_buf[..n]).await?;
 
-        let msg3 = read_frame(&mut stream).await?;
+        let msg3 = read_handshake_frame(&mut stream).await?;
         let _ = hs
             .read_message(&msg3, &mut plain_buf)
             .map_err(|e| FalkonError::Crypto(e.to_string()))?;

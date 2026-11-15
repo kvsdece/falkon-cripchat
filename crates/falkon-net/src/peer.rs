@@ -11,7 +11,9 @@ use falkon_core::error::FalkonError;
 use falkon_core::protocol::{
     ChatPayload, HistoryRetention, PeerId, PeerSummary, WireEnvelope, WireMessage,
 };
+use falkon_core::room::MAX_ACTIVE_HISTORY_MESSAGES;
 use falkon_core::sanitize::{sanitize_message, sanitize_nick};
+use falkon_core::security::{DEFAULT_REPLAY_WINDOW, ReplayGuard};
 
 use crate::framing::IDLE_READ_TIMEOUT;
 use crate::noise_channel::EncryptedChannel;
@@ -88,6 +90,7 @@ pub async fn run_peer<T: PeerTransport>(
 
     let mut my_nick = config.nick;
     let my_id = peer_id_from_pubkey(config.identity.public_key());
+    let mut replay_guard = ReplayGuard::new(DEFAULT_REPLAY_WINDOW);
 
     sender
         .send_envelope(&WireEnvelope::new(WireMessage::JoinRequest {
@@ -168,6 +171,7 @@ pub async fn run_peer<T: PeerTransport>(
                         if let Ok(body) = sanitize_message(&raw)
                             && let Ok(msg_id) = random_bytes::<16>()
                         {
+                            let _ = replay_guard.check_and_insert(msg_id);
                             let payload = ChatPayload {
                                 msg_id,
                                 sender_id: my_id,
@@ -213,6 +217,9 @@ pub async fn run_peer<T: PeerTransport>(
                 };
                 match env.message {
                     WireMessage::Chat(mut payload) => {
+                        if !replay_guard.check_and_insert(payload.msg_id) {
+                            continue;
+                        }
                         if let Ok(clean) = sanitize_message(&payload.body) {
                             payload.body = clean;
                             if let Ok(clean_nick) = sanitize_nick(&payload.sender_nick) {
@@ -222,8 +229,13 @@ pub async fn run_peer<T: PeerTransport>(
                         }
                     }
                     WireMessage::HistorySync { messages } => {
-                        let mut sanitized = Vec::with_capacity(messages.len());
-                        for mut m in messages {
+                        let mut sanitized = Vec::with_capacity(
+                            messages.len().min(MAX_ACTIVE_HISTORY_MESSAGES),
+                        );
+                        for mut m in messages.into_iter().take(MAX_ACTIVE_HISTORY_MESSAGES) {
+                            if !replay_guard.check_and_insert(m.msg_id) {
+                                continue;
+                            }
                             if let Ok(clean) = sanitize_message(&m.body) {
                                 m.body = clean;
                                 if let Ok(clean_nick) = sanitize_nick(&m.sender_nick) {

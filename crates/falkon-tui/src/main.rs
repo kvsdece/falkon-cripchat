@@ -188,8 +188,17 @@ impl AppState {
     }
 }
 
+fn disable_core_dumps() {
+    #[cfg(unix)]
+    {
+        let _ = rlimit::Resource::CORE.set(0, 0);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    disable_core_dumps();
+
     let cli = Cli::parse();
     let nick = sanitize_nick(&cli.nick)?;
     let retention: HistoryRetention = cli.retention.into();
@@ -562,7 +571,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
         .split(frame.area());
 
     let header = Paragraph::new(format!(
-        "FALKON v0.2.1 (Sofia) | Nick: {} | FP: {} | Retencao: {}\nModo: {} | {}",
+        "FALKON v0.3.0 (Diego) | Nick: {} | FP: {} | Retencao: {}\nModo: {} | {}",
         app.nick, app.fingerprint, app.retention_label, app.mode_label, app.status_line
     ))
     .wrap(Wrap { trim: false })

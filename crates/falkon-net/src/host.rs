@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::time::timeout;
 use zeroize::Zeroizing;
 
 use falkon_core::crypto::{IdentityKeypair, peer_id_from_pubkey, random_bytes};
@@ -13,15 +14,20 @@ use falkon_core::protocol::{
 };
 use falkon_core::room::{AdmissionVote, EphemeralHistory, MAX_PENDING_CANDIDATES, VoteProgress};
 use falkon_core::sanitize::{sanitize_message, sanitize_nick};
+use falkon_core::security::{DEFAULT_REPLAY_WINDOW, ReplayGuard, TokenBucket, cooldown_ready};
 
 use crate::framing::IDLE_READ_TIMEOUT;
 use crate::noise_channel::EncryptedChannel;
+use crate::ratelimit::ConnectionRateLimiter;
 use crate::session::send_room_salt;
 use crate::transport::{BoxedStream, PeerEndpoint, PeerTransport};
 
 pub const MAX_ACTIVE_PEERS: usize = 16;
+pub const MAX_INFLIGHT_HANDSHAKES: usize = 8;
+const HANDSHAKE_BUDGET: Duration = Duration::from_secs(10);
 const PEER_OUTBOX_CAP: usize = 64;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const NICK_UPDATE_COOLDOWN: Duration = Duration::from_secs(3);
 
 pub struct HostConfig {
     pub listen_addr: String,
@@ -71,6 +77,7 @@ pub enum HostCommand {
 enum InternalEvent {
     Incoming {
         stream: BoxedStream,
+        endpoint: PeerEndpoint,
     },
     CandidateJoinedLobby {
         candidate_id: PeerId,
@@ -89,6 +96,8 @@ struct ActivePeer {
     nick: String,
     fingerprint: String,
     out_tx: mpsc::Sender<WireEnvelope>,
+    rate_bucket: TokenBucket,
+    last_nick_update: Option<Instant>,
 }
 
 struct PendingPeer {
@@ -127,9 +136,9 @@ pub async fn run_host<T: PeerTransport + 'static>(
 
     let accept_tx = int_tx.clone();
     let accept_task = tokio::spawn(async move {
-        while let Ok((stream, _ep)) = listener.accept().await {
+        while let Ok((stream, endpoint)) = listener.accept().await {
             if accept_tx
-                .send(InternalEvent::Incoming { stream })
+                .send(InternalEvent::Incoming { stream, endpoint })
                 .await
                 .is_err()
             {
@@ -141,6 +150,9 @@ pub async fn run_host<T: PeerTransport + 'static>(
     let mut history = EphemeralHistory::new(config.retention);
     let mut active_peers: HashMap<PeerId, ActivePeer> = HashMap::new();
     let mut pending_peers: HashMap<PeerId, PendingPeer> = HashMap::new();
+    let mut replay_guard = ReplayGuard::new(DEFAULT_REPLAY_WINDOW);
+    let mut conn_limiter = ConnectionRateLimiter::default();
+    let handshake_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES));
 
     let mut tick_1s = tokio::time::interval(Duration::from_secs(1));
     let mut ping_tick = tokio::time::interval(KEEPALIVE_INTERVAL);
@@ -200,6 +212,7 @@ pub async fn run_host<T: PeerTransport + 'static>(
                         if let Ok(clean_body) = sanitize_message(&raw_text)
                             && let Ok(msg_id) = random_bytes::<16>()
                         {
+                            let _ = replay_guard.check_and_insert(msg_id);
                             let payload = ChatPayload {
                                 msg_id,
                                 sender_id: host_id,
@@ -256,7 +269,14 @@ pub async fn run_host<T: PeerTransport + 'static>(
                     break;
                 };
                 match ev {
-                    InternalEvent::Incoming { mut stream } => {
+                    InternalEvent::Incoming { mut stream, endpoint } => {
+                        if !conn_limiter.allow(&endpoint, Instant::now()) {
+                            let _ = event_tx.send(HostEvent::SystemNotice(
+                                "Conexao bloqueada temporariamente (rate limit).".to_owned()
+                            )).await;
+                            continue;
+                        }
+
                         if active_peers.len() >= MAX_ACTIVE_PEERS || pending_peers.len() >= MAX_PENDING_CANDIDATES {
                             let _ = event_tx.send(HostEvent::SystemNotice(
                                 "Conexao recusada: limite de sala ou lobby atingido.".to_owned()
@@ -264,26 +284,37 @@ pub async fn run_host<T: PeerTransport + 'static>(
                             continue;
                         }
 
+                        let Ok(permit) = Arc::clone(&handshake_sem).try_acquire_owned() else {
+                            let _ = event_tx.send(HostEvent::SystemNotice(
+                                "Conexao recusada: limite de handshakes simultaneos.".to_owned()
+                            )).await;
+                            continue;
+                        };
+
                         let id_clone = Arc::clone(&host_identity);
                         let psk_clone = Arc::clone(&psk);
                         let tx_clone = int_tx.clone();
                         let room_salt = config.room_salt;
 
                         tokio::spawn(async move {
-                            if send_room_salt(&mut stream, &room_salt).await.is_err() {
-                                return;
-                            }
-                            let Ok(channel) = EncryptedChannel::accept_responder(stream, &id_clone, &psk_clone).await else {
+                            let pre_lobby = timeout(HANDSHAKE_BUDGET, async {
+                                send_room_salt(&mut stream, &room_salt).await?;
+                                let channel = EncryptedChannel::accept_responder(
+                                    stream, &id_clone, &psk_clone,
+                                ).await?;
+                                let (sender, mut receiver) = channel.into_split();
+                                let fingerprint = receiver.remote_fingerprint().to_owned();
+                                let candidate_id = receiver.remote_peer_id();
+                                let first_env = receiver.recv_envelope(Duration::from_secs(5)).await?;
+                                Ok::<_, FalkonError>((sender, receiver, fingerprint, candidate_id, first_env))
+                            }).await;
+
+                            drop(permit);
+
+                            let Ok(Ok((mut sender, mut receiver, fingerprint, candidate_id, first_env))) = pre_lobby else {
                                 return;
                             };
 
-                            let (mut sender, mut receiver) = channel.into_split();
-                            let fingerprint = receiver.remote_fingerprint().to_owned();
-                            let candidate_id = receiver.remote_peer_id();
-
-                            let Ok(first_env) = receiver.recv_envelope(Duration::from_secs(15)).await else {
-                                return;
-                            };
                             let WireMessage::JoinRequest { nick } = first_env.message else {
                                 return;
                             };
@@ -378,15 +409,25 @@ pub async fn run_host<T: PeerTransport + 'static>(
                         if !active_peers.contains_key(&peer_id) {
                             continue;
                         }
+                        let now = Instant::now();
                         match envelope.message {
                             WireMessage::Chat(mut payload) => {
+                                let allowed = active_peers
+                                    .get_mut(&peer_id)
+                                    .is_some_and(|p| p.rate_bucket.allow(now));
+                                if !allowed {
+                                    continue;
+                                }
+                                if !replay_guard.check_and_insert(payload.msg_id) {
+                                    continue;
+                                }
                                 if let Ok(clean_body) = sanitize_message(&payload.body)
                                     && let Some(sender_info) = active_peers.get(&peer_id)
                                 {
                                     payload.sender_id = peer_id;
                                     payload.sender_nick = sender_info.nick.clone();
                                     payload.body = clean_body;
-                                    history.push(payload.clone(), Instant::now());
+                                    history.push(payload.clone(), now);
                                     let relay = WireEnvelope::new(WireMessage::Chat(payload.clone()));
                                     broadcast_to_peers(&active_peers, &relay, Some(peer_id));
                                     let _ = event_tx.send(HostEvent::ChatReceived(payload)).await;
@@ -410,8 +451,10 @@ pub async fn run_host<T: PeerTransport + 'static>(
                             WireMessage::NickUpdate { new_nick } => {
                                 if let Ok(clean) = sanitize_nick(&new_nick)
                                     && let Some(peer) = active_peers.get_mut(&peer_id)
+                                    && cooldown_ready(peer.last_nick_update, NICK_UPDATE_COOLDOWN, now)
                                 {
                                     peer.nick = clean;
+                                    peer.last_nick_update = Some(now);
                                     let list = build_peer_list(host_id, &host_nick, &host_fp, &active_peers);
                                     let env = WireEnvelope::new(WireMessage::PeerList { peers: list.clone() });
                                     broadcast_to_peers(&active_peers, &env, None);
@@ -552,6 +595,8 @@ async fn resolve_vote(
                     nick: candidate_nick.clone(),
                     fingerprint: candidate_fp,
                     out_tx: pending.out_tx,
+                    rate_bucket: TokenBucket::new(12.0, 4.0, now),
+                    last_nick_update: None,
                 },
             );
 
@@ -608,5 +653,92 @@ fn broadcast_to_peers(
             continue;
         }
         let _ = peer.out_tx.try_send(env.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer::{PeerCommand, PeerConfig, PeerEvent, run_peer};
+    use crate::transport::DirectTcpTransport;
+    use falkon_core::crypto::{RoomSecret, derive_room_psk};
+    use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn stalled_attacker_does_not_block_legitimate_peer() -> Result<(), FalkonError> {
+        let transport = Arc::new(DirectTcpTransport);
+        let salt = [0x77u8; 16];
+        let secret = RoomSecret::new("diego-hardening-test".to_owned())?;
+        let psk = derive_room_psk(&secret, &salt)?;
+        let host_id = IdentityKeypair::generate()?;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+
+        let cfg = HostConfig {
+            listen_addr: "127.0.0.1:0".to_owned(),
+            nick: "Host".to_owned(),
+            retention: HistoryRetention::Secs15,
+            identity: host_id,
+            psk,
+            room_salt: salt,
+        };
+
+        let host_handle = tokio::spawn(run_host(Arc::clone(&transport), cfg, cmd_rx, ev_tx));
+
+        let listen_addr = match ev_rx.recv().await {
+            Some(HostEvent::Listening(addr)) => addr,
+            _ => return Err(FalkonError::InvalidState("host nao iniciou escuta")),
+        };
+
+        // Atacante abre socket TCP e trava sem enviar handshake Noise
+        let _stalled_attacker = TcpStream::connect(&listen_addr)
+            .await
+            .map_err(|e| FalkonError::Io(e.to_string()))?;
+
+        // Peer legitimo deve conectar e ser admitido normalmente sem ficar bloqueado
+        let peer_id = IdentityKeypair::generate()?;
+        let (p_cmd_tx, p_cmd_rx) = mpsc::channel(16);
+        let (p_ev_tx, mut p_ev_rx) = mpsc::channel(32);
+        let peer_cfg = PeerConfig {
+            connect_addr: listen_addr,
+            nick: "Diego".to_owned(),
+            identity: peer_id,
+            secret,
+        };
+        let peer_handle = tokio::spawn(run_peer(
+            Arc::clone(&transport),
+            peer_cfg,
+            p_cmd_rx,
+            p_ev_tx,
+        ));
+
+        let mut admitted = false;
+        while let Some(ev) = ev_rx.recv().await {
+            if let HostEvent::CandidateWaiting { candidate_id, .. } = ev {
+                let _ = cmd_tx
+                    .send(HostCommand::CastVote {
+                        candidate_id,
+                        allow_entry: true,
+                        share_history: false,
+                    })
+                    .await;
+                break;
+            }
+        }
+
+        while let Some(pev) = p_ev_rx.recv().await {
+            if matches!(pev, PeerEvent::Admitted { .. }) {
+                admitted = true;
+                break;
+            }
+        }
+        assert!(admitted);
+
+        let _ = p_cmd_tx.send(PeerCommand::Disconnect).await;
+        let _ = cmd_tx.send(HostCommand::Shutdown).await;
+        let _ = peer_handle.await;
+        let _ = host_handle.await;
+        Ok(())
     }
 }

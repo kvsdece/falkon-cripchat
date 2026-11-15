@@ -139,7 +139,7 @@ falkon/
 | **M0 — Auditoria *Locust* (Python)** | Análise do legado | `v0.0.0-locust` | Segurança *(Base)* | **Concluído** |
 | **M1 — Base, Cripto & Abstração TCP** | [Ponto 1](#ponto-1) + [Ponto 2](#ponto-2) | `v0.1.0` | Implementação — **"Clara"** | **Concluído** |
 | **M2 — Motor Host & Votação P2P** | [Ponto 3](#ponto-3) | `v0.2.0` | Implementação — **"Sofía"** | **Concluído** |
-| **M3 — Blindagem & Anti-DoS** | [Ponto 4](#ponto-4) | `v0.3.0` | Segurança — **"Diego"** | Pendente |
+| **M3 — Blindagem & Anti-DoS** | [Ponto 4](#ponto-4) | `v0.3.0` | Segurança — **"Diego"** | **Concluído** |
 | **M4 — Interface TUI (`ratatui`)** | [Ponto 5](#ponto-5) | `v0.4.0` | Implementação — **"Helena"** | Pendente |
 | **M5 — Auditoria & Fuzzing (1.0)** | [Ponto 6](#ponto-6) | `v1.0.0` | Segurança — **"Mateus"** | Pendente |
 | **M6 — Rede `.onion` Nativa** | [Ponto 7](#ponto-7) | `v2.0.0` | Implementação — **"Valentina"** | Pendente |

@@ -140,6 +140,12 @@ impl AdmissionVote {
             ));
         }
 
+        if self.votes.contains_key(&voter_id) {
+            return Err(FalkonError::InvalidInput(
+                "voto duplicado pelo mesmo membro",
+            ));
+        }
+
         self.votes
             .insert(voter_id, (allow_entry, allow_entry && share_history));
 
@@ -216,6 +222,9 @@ mod tests {
 
         let p1 = vote.cast_vote(host, true, true, now)?;
         assert_eq!(p1, VoteProgress::Pending);
+
+        // Voto duplicado do mesmo membro deve ser rejeitado
+        assert!(vote.cast_vote(host, true, false, now).is_err());
 
         let p2 = vote.cast_vote(peer_a, true, false, now)?;
         assert_eq!(
