@@ -1,0 +1,41 @@
+name: Release Binary
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run security checks and tests
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build --release -p falkon-tui
+
+      - name: Package binary and SHA-256
+        run: |
+          cp target/release/falkon falkon-linux-x86_64
+          sha256sum falkon-linux-x86_64 > falkon-linux-x86_64.sha256
+
+      - name: Attach assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            falkon-linux-x86_64 \
+            falkon-linux-x86_64.sha256 \
+            --clobber
