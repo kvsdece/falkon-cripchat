@@ -6,7 +6,7 @@ use zeroize::Zeroizing;
 
 use falkon_core::crypto::{
     IdentityKeypair, MAX_NOISE_MSG_LEN, NOISE_TAG_LEN, build_initiator_handshake,
-    build_responder_handshake, fingerprint_from_pubkey,
+    build_responder_handshake, fingerprint_from_pubkey, peer_id_from_pubkey,
 };
 use falkon_core::error::FalkonError;
 use falkon_core::protocol::{WireEnvelope, decode_padded_envelope, encode_padded_envelope};
@@ -17,6 +17,7 @@ pub struct EncryptedChannel<S> {
     stream: S,
     transport: snow::TransportState,
     remote_fingerprint: String,
+    remote_peer_id: [u8; 16],
 }
 
 pub struct ChannelSender<S> {
@@ -28,6 +29,7 @@ pub struct ChannelReceiver<S> {
     reader: ReadHalf<S>,
     transport: Arc<Mutex<snow::TransportState>>,
     remote_fingerprint: String,
+    remote_peer_id: [u8; 16],
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedChannel<S> {
@@ -59,6 +61,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedChannel<S> {
             .get_remote_static()
             .ok_or(FalkonError::InvalidState("peer sem chave estatica"))?;
         let remote_fingerprint = fingerprint_from_pubkey(remote_pub);
+        let remote_peer_id = peer_id_from_pubkey(remote_pub);
 
         let transport = hs
             .into_transport_mode()
@@ -68,6 +71,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedChannel<S> {
             stream,
             transport,
             remote_fingerprint,
+            remote_peer_id,
         })
     }
 
@@ -99,6 +103,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedChannel<S> {
             .get_remote_static()
             .ok_or(FalkonError::InvalidState("peer sem chave estatica"))?;
         let remote_fingerprint = fingerprint_from_pubkey(remote_pub);
+        let remote_peer_id = peer_id_from_pubkey(remote_pub);
 
         let transport = hs
             .into_transport_mode()
@@ -108,11 +113,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedChannel<S> {
             stream,
             transport,
             remote_fingerprint,
+            remote_peer_id,
         })
     }
 
     pub fn remote_fingerprint(&self) -> &str {
         &self.remote_fingerprint
+    }
+
+    pub fn remote_peer_id(&self) -> [u8; 16] {
+        self.remote_peer_id
     }
 
     pub fn into_split(self) -> (ChannelSender<S>, ChannelReceiver<S>) {
@@ -127,6 +137,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EncryptedChannel<S> {
                 reader,
                 transport,
                 remote_fingerprint: self.remote_fingerprint,
+                remote_peer_id: self.remote_peer_id,
             },
         )
     }
@@ -191,6 +202,10 @@ impl<S: AsyncRead + Unpin> ChannelReceiver<S> {
         &self.remote_fingerprint
     }
 
+    pub fn remote_peer_id(&self) -> [u8; 16] {
+        self.remote_peer_id
+    }
+
     pub async fn recv_envelope(
         &mut self,
         read_timeout: Duration,
@@ -235,6 +250,7 @@ mod tests {
 
         let host_fp = host_id.fingerprint();
         let peer_fp = peer_id.fingerprint();
+        let expected_host_pid = peer_id_from_pubkey(host_id.public_key());
         let psk_host = Zeroizing::new(*psk);
 
         let host_task = tokio::spawn(async move {
@@ -264,6 +280,7 @@ mod tests {
         let stream = transport.connect(&addr).await?;
         let mut peer_ch = EncryptedChannel::connect_initiator(stream, &peer_id, &psk).await?;
         assert_eq!(peer_ch.remote_fingerprint(), host_fp);
+        assert_eq!(peer_ch.remote_peer_id(), expected_host_pid);
 
         peer_ch
             .send_envelope(&WireEnvelope::new(WireMessage::JoinRequest {

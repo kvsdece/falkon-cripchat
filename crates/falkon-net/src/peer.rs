@@ -1,12 +1,12 @@
-// Caminho: crates/falkon-net/src/peer.rs
-
 use core::time::Duration;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
-use falkon_core::crypto::{IdentityKeypair, RoomSecret, derive_room_psk, random_bytes};
+use falkon_core::crypto::{
+    IdentityKeypair, RoomSecret, derive_room_psk, peer_id_from_pubkey, random_bytes,
+};
 use falkon_core::error::FalkonError;
 use falkon_core::protocol::{
     ChatPayload, HistoryRetention, PeerId, PeerSummary, WireEnvelope, WireMessage,
@@ -80,7 +80,6 @@ pub async fn run_peer<T: PeerTransport>(
     let room_salt = recv_room_salt(&mut stream).await?;
     let psk = derive_room_psk(&config.secret, &room_salt)?;
 
-    // Drop explicito do segredo bruto assim que a PSK e derivada
     drop(config.secret);
 
     let channel = EncryptedChannel::connect_initiator(stream, &config.identity, &psk).await?;
@@ -88,7 +87,7 @@ pub async fn run_peer<T: PeerTransport>(
     let (mut sender, mut receiver) = channel.into_split();
 
     let mut my_nick = config.nick;
-    let my_id = random_bytes::<16>()?;
+    let my_id = peer_id_from_pubkey(config.identity.public_key());
 
     sender
         .send_envelope(&WireEnvelope::new(WireMessage::JoinRequest {

@@ -6,7 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
-use falkon_core::crypto::{IdentityKeypair, random_bytes};
+use falkon_core::crypto::{IdentityKeypair, peer_id_from_pubkey, random_bytes};
 use falkon_core::error::FalkonError;
 use falkon_core::protocol::{
     ChatPayload, HistoryRetention, PeerId, PeerSummary, WireEnvelope, WireMessage,
@@ -117,7 +117,7 @@ pub async fn run_host<T: PeerTransport + 'static>(
     };
     let _ = event_tx.send(HostEvent::Listening(display_endpoint)).await;
 
-    let host_id = random_bytes::<16>()?;
+    let host_id = peer_id_from_pubkey(config.identity.public_key());
     let mut host_nick = config.nick;
     let host_fp = config.identity.fingerprint();
     let host_identity = Arc::new(config.identity);
@@ -125,7 +125,6 @@ pub async fn run_host<T: PeerTransport + 'static>(
 
     let (int_tx, mut int_rx) = mpsc::channel::<InternalEvent>(128);
 
-    // Task dedicada ao accept() TCP (handshake Noise ocorre fora dela!)
     let accept_tx = int_tx.clone();
     let accept_task = tokio::spawn(async move {
         while let Ok((stream, _ep)) = listener.accept().await {
@@ -280,6 +279,7 @@ pub async fn run_host<T: PeerTransport + 'static>(
 
                             let (mut sender, mut receiver) = channel.into_split();
                             let fingerprint = receiver.remote_fingerprint().to_owned();
+                            let candidate_id = receiver.remote_peer_id();
 
                             let Ok(first_env) = receiver.recv_envelope(Duration::from_secs(15)).await else {
                                 return;
@@ -288,9 +288,6 @@ pub async fn run_host<T: PeerTransport + 'static>(
                                 return;
                             };
                             let Ok(clean_nick) = sanitize_nick(&nick) else {
-                                return;
-                            };
-                            let Ok(candidate_id) = random_bytes::<16>() else {
                                 return;
                             };
 
@@ -328,6 +325,16 @@ pub async fn run_host<T: PeerTransport + 'static>(
                     }
 
                     InternalEvent::CandidateJoinedLobby { candidate_id, nick, fingerprint, out_tx } => {
+                        if active_peers.contains_key(&candidate_id) || pending_peers.contains_key(&candidate_id) {
+                            let _ = out_tx.try_send(WireEnvelope::new(WireMessage::JoinDecision {
+                                accepted: false,
+                                history_shared: false,
+                                retention: history.retention(),
+                                reason: Some("identidade ja conectada na sala".to_owned()),
+                            }));
+                            continue;
+                        }
+
                         if pending_peers.len() >= MAX_PENDING_CANDIDATES {
                             let _ = out_tx.try_send(WireEnvelope::new(WireMessage::JoinDecision {
                                 accepted: false,

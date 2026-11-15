@@ -85,6 +85,14 @@ pub fn fingerprint_from_pubkey(pubkey: &[u8]) -> String {
     )
 }
 
+/// Deriva um PeerId criptografico de 16 bytes a partir da chave publica Noise.
+pub fn peer_id_from_pubkey(pubkey: &[u8]) -> [u8; 16] {
+    let digest = Sha256::digest(pubkey);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    id
+}
+
 pub fn random_bytes<const N: usize>() -> Result<[u8; N], FalkonError> {
     let mut buf = [0u8; N];
     getrandom::fill(&mut buf)
