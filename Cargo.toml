@@ -1,4 +1,3 @@
-
 [workspace]
 resolver = "3"
 members = [
@@ -19,3 +18,9 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

@@ -24,7 +24,7 @@ use crate::transport::{BoxedStream, PeerEndpoint, PeerTransport};
 
 pub const MAX_ACTIVE_PEERS: usize = 16;
 pub const MAX_INFLIGHT_HANDSHAKES: usize = 8;
-const HANDSHAKE_BUDGET: Duration = Duration::from_secs(10);
+const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
 const PEER_OUTBOX_CAP: usize = 64;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const NICK_UPDATE_COOLDOWN: Duration = Duration::from_secs(3);
@@ -657,6 +657,7 @@ fn broadcast_to_peers(
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::peer::{PeerCommand, PeerConfig, PeerEvent, run_peer};
@@ -686,8 +687,8 @@ mod tests {
 
         let host_handle = tokio::spawn(run_host(Arc::clone(&transport), cfg, cmd_rx, ev_tx));
 
-        let listen_addr = match ev_rx.recv().await {
-            Some(HostEvent::Listening(addr)) => addr,
+        let listen_addr = match timeout(Duration::from_secs(5), ev_rx.recv()).await {
+            Ok(Some(HostEvent::Listening(addr))) => addr,
             _ => return Err(FalkonError::InvalidState("host nao iniciou escuta")),
         };
 
@@ -713,27 +714,38 @@ mod tests {
             p_ev_tx,
         ));
 
-        let mut admitted = false;
-        while let Some(ev) = ev_rx.recv().await {
-            if let HostEvent::CandidateWaiting { candidate_id, .. } = ev {
-                let _ = cmd_tx
-                    .send(HostCommand::CastVote {
-                        candidate_id,
-                        allow_entry: true,
-                        share_history: false,
-                    })
-                    .await;
-                break;
+        let wait_vote = timeout(Duration::from_secs(10), async {
+            while let Some(ev) = ev_rx.recv().await {
+                if let HostEvent::CandidateWaiting { candidate_id, .. } = ev {
+                    let _ = cmd_tx
+                        .send(HostCommand::CastVote {
+                            candidate_id,
+                            allow_entry: true,
+                            share_history: false,
+                        })
+                        .await;
+                    return Ok::<(), FalkonError>(());
+                }
             }
-        }
+            Err(FalkonError::InvalidState(
+                "ev_rx encerrou sem CandidateWaiting",
+            ))
+        })
+        .await
+        .map_err(|_| FalkonError::Io("timeout aguardando CandidateWaiting".to_owned()))?;
+        wait_vote?;
 
-        while let Some(pev) = p_ev_rx.recv().await {
-            if matches!(pev, PeerEvent::Admitted { .. }) {
-                admitted = true;
-                break;
+        let wait_admit = timeout(Duration::from_secs(10), async {
+            while let Some(pev) = p_ev_rx.recv().await {
+                if matches!(pev, PeerEvent::Admitted { .. }) {
+                    return Ok::<(), FalkonError>(());
+                }
             }
-        }
-        assert!(admitted);
+            Err(FalkonError::InvalidState("p_ev_rx encerrou sem Admitted"))
+        })
+        .await
+        .map_err(|_| FalkonError::Io("timeout aguardando Admitted".to_owned()))?;
+        wait_admit?;
 
         let _ = p_cmd_tx.send(PeerCommand::Disconnect).await;
         let _ = cmd_tx.send(HostCommand::Shutdown).await;

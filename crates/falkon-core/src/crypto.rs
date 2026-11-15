@@ -11,15 +11,21 @@ pub const NOISE_PATTERN: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
 pub const NOISE_PROLOGUE: &[u8] = b"FALKON-PROTO-V1";
 pub const MAX_NOISE_MSG_LEN: usize = 65_535;
 pub const NOISE_TAG_LEN: usize = 16;
+pub const MIN_ROOM_SECRET_LEN: usize = 12;
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct RoomSecret(String);
 
 impl RoomSecret {
     pub fn new(secret: String) -> Result<Self, FalkonError> {
-        if secret.len() < 6 {
+        if secret.len() < MIN_ROOM_SECRET_LEN {
             return Err(FalkonError::InvalidInput(
-                "segredo da sala deve ter ao menos 6 bytes",
+                "segredo da sala deve ter ao menos 12 bytes/caracteres",
+            ));
+        }
+        if secret.bytes().all(|b| Some(b) == secret.bytes().next()) {
+            return Err(FalkonError::InvalidInput(
+                "segredo da sala nao pode repetir o mesmo caractere",
             ));
         }
         Ok(Self(secret))
@@ -69,6 +75,10 @@ impl IdentityKeypair {
     pub fn fingerprint(&self) -> String {
         fingerprint_from_pubkey(&self.public)
     }
+
+    pub fn full_fingerprint(&self) -> String {
+        full_fingerprint_from_pubkey(&self.public)
+    }
 }
 
 impl fmt::Debug for IdentityKeypair {
@@ -77,15 +87,40 @@ impl fmt::Debug for IdentityKeypair {
     }
 }
 
+/// Gera fingerprint de 128 bits (16 primeiros bytes do SHA-256).
 pub fn fingerprint_from_pubkey(pubkey: &[u8]) -> String {
-    let digest = Sha256::digest(pubkey);
+    let d = Sha256::digest(pubkey);
     format!(
-        "{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}",
-        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7]
+        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}",
+        d[0],
+        d[1],
+        d[2],
+        d[3],
+        d[4],
+        d[5],
+        d[6],
+        d[7],
+        d[8],
+        d[9],
+        d[10],
+        d[11],
+        d[12],
+        d[13],
+        d[14],
+        d[15]
     )
 }
 
-/// Deriva um PeerId criptografico de 16 bytes a partir da chave publica Noise.
+/// Gera fingerprint completo de 256 bits (SHA-256 integral em hex).
+pub fn full_fingerprint_from_pubkey(pubkey: &[u8]) -> String {
+    let d = Sha256::digest(pubkey);
+    let mut out = String::with_capacity(64);
+    for byte in d {
+        out.push_str(&format!("{byte:02X}"));
+    }
+    out
+}
+
 pub fn peer_id_from_pubkey(pubkey: &[u8]) -> [u8; 16] {
     let digest = Sha256::digest(pubkey);
     let mut id = [0u8; 16];
@@ -165,6 +200,21 @@ pub fn build_responder_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_secret_enforces_min_length_and_variation() {
+        assert!(RoomSecret::new("123456".to_owned()).is_err());
+        assert!(RoomSecret::new("aaaaaaaaaaaa".to_owned()).is_err());
+        assert!(RoomSecret::new("frase-segura-falkon".to_owned()).is_ok());
+    }
+
+    #[test]
+    fn fingerprint_lengths_are_128_and_256_bits() -> Result<(), FalkonError> {
+        let id = IdentityKeypair::generate()?;
+        assert_eq!(id.fingerprint().len(), 35); // 32 hex + 3 hifens (128 bits)
+        assert_eq!(id.full_fingerprint().len(), 64); // 64 hex (256 bits)
+        Ok(())
+    }
 
     #[test]
     fn noise_xxpsk3_handshake_succeeds_and_rejects_wrong_psk() -> Result<(), FalkonError> {

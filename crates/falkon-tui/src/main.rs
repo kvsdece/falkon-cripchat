@@ -5,6 +5,7 @@
 use core::time::Duration;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -97,7 +98,10 @@ struct PendingVotePrompt {
 }
 
 enum DisplayEntry {
-    Chat(ChatPayload),
+    Chat {
+        payload: ChatPayload,
+        received_at: Instant,
+    },
     Notice {
         tag: &'static str,
         color: Color,
@@ -115,8 +119,10 @@ struct AppState {
     my_peer_id: PeerId,
     nick: String,
     fingerprint: String,
+    full_fingerprint: String,
     mode_label: String,
-    retention_label: String,
+    retention: HistoryRetention,
+    retention_known: bool,
     status_line: String,
     messages: VecDeque<DisplayEntry>,
     peers: Vec<PeerSummary>,
@@ -152,8 +158,15 @@ impl AppState {
     }
 
     fn push_chat(&mut self, payload: ChatPayload) {
+        self.push_chat_at(payload, Instant::now());
+    }
+
+    fn push_chat_at(&mut self, payload: ChatPayload, now: Instant) {
         let _ = self.ensure_peer_color(payload.sender_id);
-        self.push_entry(DisplayEntry::Chat(payload));
+        self.push_entry(DisplayEntry::Chat {
+            payload,
+            received_at: now,
+        });
     }
 
     fn push_notice(&mut self, tag: &'static str, color: Color, text: String) {
@@ -174,10 +187,37 @@ impl AppState {
         self.peers = list;
     }
 
+    /// Expira e zeroiza da RAM mensagens exibidas na UI cuja retencao TTL venceu.
+    fn purge_expired_ui(&mut self, now: Instant) -> usize {
+        if !self.retention_known {
+            return 0;
+        }
+        let Some(ttl) = self.retention.as_duration() else {
+            return 0;
+        };
+
+        let mut removed = 0usize;
+        let mut kept = VecDeque::with_capacity(self.messages.len());
+        while let Some(mut entry) = self.messages.pop_front() {
+            match &mut entry {
+                DisplayEntry::Chat {
+                    payload,
+                    received_at,
+                } if now.saturating_duration_since(*received_at) >= ttl => {
+                    payload.zeroize();
+                    removed += 1;
+                }
+                _ => kept.push_back(entry),
+            }
+        }
+        self.messages = kept;
+        removed
+    }
+
     fn wipe_ram(&mut self) {
         for mut entry in self.messages.drain(..) {
             match &mut entry {
-                DisplayEntry::Chat(payload) => payload.zeroize(),
+                DisplayEntry::Chat { payload, .. } => payload.zeroize(),
                 DisplayEntry::Notice { text, .. } => text.zeroize(),
             }
         }
@@ -204,12 +244,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let retention: HistoryRetention = cli.retention.into();
     let identity = IdentityKeypair::generate()?;
     let my_fp = identity.fingerprint();
+    let my_full_fp = identity.full_fingerprint();
     let my_peer_id = peer_id_from_pubkey(identity.public_key());
 
-    let (net_ctrl, mut host_ev_rx, mut peer_ev_rx, mode_label, retention_label) =
+    let (net_ctrl, mut host_ev_rx, mut peer_ev_rx, mode_label, retention_known) =
         match (cli.listen, cli.connect) {
             (Some(listen_addr), _) => {
-                let raw_secret = rpassword::prompt_password("Segredo da sala (oculto): ")?;
+                let raw_secret =
+                    rpassword::prompt_password("Segredo da sala (min. 12 chars, oculto): ")?;
                 let secret = RoomSecret::new(raw_secret)?;
                 let room_salt = random_bytes::<16>()?;
                 let psk = derive_room_psk(&secret, &room_salt)?;
@@ -236,11 +278,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(ev_rx),
                     None,
                     format!("HOST ({listen_addr})"),
-                    retention.label().to_owned(),
+                    true,
                 )
             }
             (None, Some(connect_addr)) => {
-                let raw_secret = rpassword::prompt_password("Segredo da sala (oculto): ")?;
+                let raw_secret =
+                    rpassword::prompt_password("Segredo da sala (min. 12 chars, oculto): ")?;
                 let secret = RoomSecret::new(raw_secret)?;
 
                 let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -262,7 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None,
                     Some(ev_rx),
                     format!("PEER -> {connect_addr}"),
-                    "Definida pelo Host".to_owned(),
+                    false,
                 )
             }
             (None, None) => (
@@ -270,7 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 "PREVIEW (use --listen ou --connect)".to_owned(),
-                retention.label().to_owned(),
+                true,
             ),
         };
 
@@ -278,8 +321,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         my_peer_id,
         nick,
         fingerprint: my_fp,
+        full_fingerprint: my_full_fp,
         mode_label,
-        retention_label,
+        retention,
+        retention_known,
         status_line: "Canal pronto.".to_owned(),
         messages: VecDeque::new(),
         peers: Vec::new(),
@@ -293,12 +338,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.push_notice(
         "SISTEMA",
         Color::DarkGray,
-        "Comandos: /nick <nome> | /wipe (limpar e sair) | /quit | ESC para sair".to_owned(),
+        "Comandos: /nick <nome> | /fingerprint | /wipe (limpar e sair) | /quit | ESC sai"
+            .to_owned(),
     );
 
     let mut terminal = ratatui::init();
     let _guard = TerminalGuard;
     let mut ui_tick = tokio::time::interval(Duration::from_millis(30));
+    let mut purge_tick = tokio::time::interval(Duration::from_secs(1));
 
     while !app.should_quit {
         terminal.draw(|frame| draw_ui(frame, &app))?;
@@ -311,6 +358,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         handle_key(key.code, &mut app, &net_ctrl).await;
                     }
+                }
+            }
+
+            _ = purge_tick.tick() => {
+                let removed = app.purge_expired_ui(Instant::now());
+                if removed > 0 && matches!(net_ctrl, NetControl::Peer(_)) {
+                    app.status_line = format!(
+                        "Ciclo TTL: {removed} msg(s) zerada(s) da RAM e tela"
+                    );
                 }
             }
 
@@ -361,8 +417,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.sync_peers(list);
                     }
                     Some(HostEvent::HistoryPurged { removed, remaining }) => {
+                        let _ = app.purge_expired_ui(Instant::now());
                         app.status_line = format!(
-                            "Ciclo TTL: {removed} msg(s) zerada(s) da RAM | Ativas: {remaining}"
+                            "Ciclo TTL: {removed} msg(s) zerada(s) da RAM e tela | Ativas: {remaining}"
                         );
                     }
                     None => {
@@ -383,7 +440,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.push_notice("REDE", Color::Cyan, s);
                     }
                     Some(PeerEvent::Admitted { host_fingerprint, retention, history_shared }) => {
-                        app.retention_label = retention.label().to_owned();
+                        app.retention = retention;
+                        app.retention_known = true;
                         app.status_line = format!("Conectado ao Host ({host_fingerprint})");
                         let h = if history_shared { "Historico enviado" } else { "Sem historico anterior" };
                         app.push_notice(
@@ -465,6 +523,18 @@ async fn handle_key(code: KeyCode, app: &mut AppState, net: &NetControl) {
                 let wipe = text == "/wipe";
                 send_shutdown(net, wipe).await;
                 app.should_quit = true;
+                return;
+            }
+
+            if text == "/fingerprint" {
+                app.push_notice(
+                    "IDENTIDADE",
+                    Color::Cyan,
+                    format!(
+                        "Chave 128b: {}\nSHA-256 256b: {}",
+                        app.fingerprint, app.full_fingerprint
+                    ),
+                );
                 return;
             }
 
@@ -559,6 +629,11 @@ async fn send_shutdown(net: &NetControl, wipe: bool) {
 
 fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     let vote_height = if app.pending_votes.is_empty() { 0 } else { 3 };
+    let ret_label = if app.retention_known {
+        app.retention.label()
+    } else {
+        "Sincronizando..."
+    };
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -571,8 +646,8 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
         .split(frame.area());
 
     let header = Paragraph::new(format!(
-        "FALKON v0.3.0 (Diego) | Nick: {} | FP: {} | Retencao: {}\nModo: {} | {}",
-        app.nick, app.fingerprint, app.retention_label, app.mode_label, app.status_line
+        "FALKON v0.3.1 (Diego) | Nick: {} | FP: {} | Retencao: {}\nModo: {} | {}",
+        app.nick, app.fingerprint, ret_label, app.mode_label, app.status_line
     ))
     .wrap(Wrap { trim: false })
     .style(
@@ -597,7 +672,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
 
     for entry in &app.messages {
         match entry {
-            DisplayEntry::Chat(payload) => {
+            DisplayEntry::Chat { payload, .. } => {
                 let nick_color = app
                     .peer_colors
                     .get(&payload.sender_id)
@@ -668,7 +743,13 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
                 .copied()
                 .unwrap_or(Color::LightCyan);
             let role = if p.is_host { "[HOST] " } else { "" };
-            ListItem::new(vec![
+            let (fp_top, fp_bot) = if p.fingerprint.len() > 18 {
+                let (a, b) = p.fingerprint.split_at(17);
+                (a, b.trim_start_matches('-'))
+            } else {
+                (p.fingerprint.as_str(), "")
+            };
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled(
                         role,
@@ -682,10 +763,17 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
                     ),
                 ]),
                 Line::from(Span::styled(
-                    format!("  {}", p.fingerprint),
+                    format!("  {fp_top}"),
                     Style::default().fg(Color::DarkGray),
                 )),
-            ])
+            ];
+            if !fp_bot.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {fp_bot}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            ListItem::new(lines)
         })
         .collect();
     let peers_list =
@@ -709,7 +797,52 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     let input = Paragraph::new(app.input.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Mensagem (Enter envia | /nick | /wipe | ESC sai)"),
+            .title("Mensagem (Enter envia | /nick | /fingerprint | /wipe | ESC sai)"),
     );
     frame.render_widget(input, outer[3]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_messages_purge_and_zeroize_on_ttl() {
+        let start = Instant::now();
+        let mut app = AppState {
+            my_peer_id: [0u8; 16],
+            nick: "Host".to_owned(),
+            fingerprint: "0000".to_owned(),
+            full_fingerprint: "0000".to_owned(),
+            mode_label: "TEST".to_owned(),
+            retention: HistoryRetention::Secs5,
+            retention_known: true,
+            status_line: String::new(),
+            messages: VecDeque::new(),
+            peers: Vec::new(),
+            peer_colors: HashMap::new(),
+            pending_votes: VecDeque::new(),
+            input: String::new(),
+            should_quit: false,
+        };
+
+        app.push_chat_at(
+            ChatPayload {
+                msg_id: [1u8; 16],
+                sender_id: [2u8; 16],
+                sender_nick: "Diego".to_owned(),
+                body: "segredo efemero".to_owned(),
+                sent_unix_secs: 0,
+            },
+            start,
+        );
+        app.push_notice("SISTEMA", Color::DarkGray, "aviso fixo".to_owned());
+
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.purge_expired_ui(start + Duration::from_secs(3)), 0);
+        assert_eq!(app.messages.len(), 2);
+
+        assert_eq!(app.purge_expired_ui(start + Duration::from_secs(6)), 1);
+        assert_eq!(app.messages.len(), 1);
+    }
 }
